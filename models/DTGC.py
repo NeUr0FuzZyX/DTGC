@@ -157,22 +157,26 @@ class spacefuse(nn.Module):
 
     def forward(self, x):
         t, c, h, w = x.size()
-        x1 = self.cgwap(x)  
-        x2 = self.gwap(x)   
-        x1_flat = x1.view(t, -1)  
-        M_S = torch.einsum('bi,bj->bij', x1_flat, x1_flat) 
-        M_S = torch.sigmoid(M_S)
-        channel_map = torch.einsum('bi,bj->bij', x2, x2)  
-        channel_map = torch.sigmoid(channel_map)
+        x1 = self.cgwap(x)
+        x2 = self.gwap(x)
 
-        x_flat = x.view(t, c, -1)  
-        x_attn = torch.einsum('bij,bjk->bik', channel_map, x_flat)  
+        x1_flat = x1.view(t, -1)
+        M_S = torch.einsum('bi,bj->bij', x1_flat, x1_flat)
+        M_S = F.softmax(M_S, dim=-1)
+
+        channel_map = torch.einsum('bi,bj->bij', x2, x2)
+        channel_map = F.softmax(channel_map, dim=-1)
+
+        x_flat = x.view(t, c, -1)
+        x_attn = torch.einsum('bij,bjk->bik', channel_map, x_flat)
         x_attn = x_attn.view(t, c, h, w)
 
-        x_flat_t = x.view(t, c, -1).transpose(1, 2)  
-        y_attn = torch.einsum('bij,bjk->bik', M_S, x_flat_t)  
+        x_flat_t = x.view(t, c, -1).transpose(1, 2)
+        y_attn = torch.einsum('bij,bjk->bik', M_S, x_flat_t)
         y_attn = y_attn.transpose(1, 2).view(t, c, h, w)
+
         return x_attn + y_attn
+
 
 class MGCA(nn.Module):
     def __init__(self,dim,heads,mode='tpf',attn_drop=0., proj_drop=0.,tp_drop=0.):
@@ -233,13 +237,12 @@ class GCS(nn.Module):
         super(GCS, self).__init__()
         self.reverse = reverse
         self.fPlane = fPlane
-        self.ratio = ratio  # 通道参与时序建模的比例
+        self.ratio = ratio  
         self.shift_first = shift_first
 
         C_shift = int(fPlane * ratio)
         assert C_shift % 2 == 0, "C_shift must be divisible by 2 for 2-group version"
 
-        # 两个 3D 卷积（左移、右移）
         self.conv3D_l = nn.Conv3d(C_shift // 2, 1, (3, 3, 3), stride=1, padding=(0, 1, 1))
         self.conv3D_r = nn.Conv3d(C_shift // 2, 1, (3, 3, 3), stride=1, padding=(0, 1, 1))
 
@@ -338,8 +341,8 @@ class ConvNeXtBlock(nn.Module):
         super().__init__()
         self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)
         self.norm = LayerNorm2D(dim, eps=1e-6)
-        self.pwconv1 = nn.Linear(dim, 4 * dim)  # 扩展比为4的逆瓶颈
-        self.act = nn.GELU()  # 替代ReLU的激活函数
+        self.pwconv1 = nn.Linear(dim, 4 * dim)  
+        self.act = nn.GELU()  
         self.pwconv2 = nn.Linear(4 * dim, dim)
         self.gamma = nn.Parameter(layer_scale_init_value * torch.ones((dim)),
                                   requires_grad=True) if layer_scale_init_value > 0 else None
@@ -354,12 +357,12 @@ class ConvNeXtBlock(nn.Module):
         x = self.act(x)
         x = self.pwconv2(x)
         if self.gamma is not None:
-            x = self.gamma * x  # 层缩放操作
+            x = self.gamma * x  
         x = x.permute(0, 3, 1, 2)  # (B, H, W, C) -> (B, C, H, W)
-
-        # 残差连接与DropPath
+        
         x = input + self.drop_path(x)
         return x
+
 
 class ConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=1, stride=1, padding=1, dilation=1, bias=False, ln=False,
@@ -376,6 +379,8 @@ class ConvBlock(nn.Module):
         if self.gelu is not None:
             y = self.gelu(y)
         return y
+
+
 class ConvNeXt(nn.Module):
     def __init__(
             self,
@@ -437,7 +442,7 @@ class ConvNeXt(nn.Module):
         # self.tfi_proj = nn.Conv2d(384,192,1)
         self.proj1 = nn.Conv2d(384, 192, 1)
         self.act = nn.GELU()
-        self.a = nn.Parameter(torch.tensor(0.3))  # 初始为 0.5，可自动调整比例
+        self.a = nn.Parameter(torch.tensor(0.3))  
 
     def _init_weights(self, m):
         if isinstance(m, (nn.Conv2d, nn.Linear, nn.Conv3d, nn.ConvTranspose2d, nn.ConvTranspose3d)):
@@ -457,24 +462,22 @@ class ConvNeXt(nn.Module):
         return x, y
 
     def forward(self, x):
-        # ----------------- ConvNeXt Backbone -----------------
+    
         x0 = self.stages[0](self.downsample_layers[0](x))
         x1 = self.stages[1](self.downsample_layers[1](x0))
         x2 = self.stages[2](self.downsample_layers[2](x1))
         x3 = self.stages[3](self.downsample_layers[3](x2))
-        # ----------------- Decoder Stage 2 -----------------
         z0 = self.upsample1(x3)
         y1 = self.MGCA1(z0)
         z1 = self.GTCI1(z0)
         z2 = self.GTCI2(z1)
-        # ----------------- Decoder Stage 2 -----------------
         z3 = self.upsample3(z2)
         y2 = self.upsample3(y1)
         z4 = self.GTCI3(z3)
         z5 = self.GTCI4(z4)
         y3 = self.CMR1(y2,z4)
         y4 = self.CMR2(y3,z5)
-        # ----------------- Final Projections and Decoding -----------------
+        
         z_final = torch.cat([z5,y4],dim=1)
         out = self.act(self.proj1(z_final))
         out1 = self.decoder1(out)
@@ -497,3 +500,4 @@ def DTGF(pretrained=True, in_22k=True, custom_ckpt_path=None, **kwargs):
             ckpt = torch.hub.load_state_dict_from_url(model_urls[url_key], map_location='cpu')
             model.load_state_dict(ckpt.get('model', ckpt), strict=False)
     return model
+
